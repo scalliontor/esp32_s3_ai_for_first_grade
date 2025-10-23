@@ -13,7 +13,7 @@ const char* ssid = "TEN_WIFI_CUA_BAN";         // <-- THAY ĐỔI
 const char* password = "MAT_KHAU_WIFI_CUA_BAN"; // <-- THAY ĐỔI
 const char* websocket_server_host = "192.168.1.10"; // <-- THAY ĐỔI IP của server FastAPI
 const uint16_t websocket_server_port = 8000;        // <-- THAY ĐỔI Port của server
-const char* websocket_server_path = "/ws";          // <-- THAY ĐỔI Endpoint WebSocket
+    const char* websocket_server_path = "/ws";          // <-- THAY ĐỔI Endpoint WebSocket
 
 // Chân cắm phần cứng I2S (Giữ nguyên như của bạn)
 #define I2S_MIC_SERIAL_CLOCK    18

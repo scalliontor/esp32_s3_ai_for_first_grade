@@ -98,3 +98,9 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/")
 def read_root():
     return {"status": "Audio processing server is running"}
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"} 
+# Endpoint kiểm tra sức khỏe server
