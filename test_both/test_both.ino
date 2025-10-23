@@ -109,6 +109,15 @@ void audio_processing_task(void *pvParameters) {
       case STATE_STREAMING:
         // GHI TRỰC TIẾP RA LOA
         size_t bytes_written;
+        // TĂNG ÂM LƯỢNG OUTPUT RA LOA
+        float gain = 8.0;  
+        for (int i = 0; i < bytes_read / sizeof(int16_t); i++) {
+          float amplified = i2s_read_buffer[i] * gain;
+          if (amplified > 32767) amplified = 32767; 
+          if (amplified < -32768) amplified = -32768;
+          i2s_read_buffer[i] = (int16_t)amplified;
+        }
+
         i2s_write(I2S_SPEAKER_PORT, i2s_read_buffer, bytes_read, &bytes_written, portMAX_DELAY);
 
         // Bây giờ, kiểm tra sự im lặng để dừng lại
