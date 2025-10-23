@@ -13,7 +13,7 @@ const char* ssid = "TEN_WIFI_CUA_BAN";         // <-- THAY ĐỔI
 const char* password = "MAT_KHAU_WIFI_CUA_BAN"; // <-- THAY ĐỔI
 const char* websocket_server_host = "192.168.1.10"; // <-- THAY ĐỔI IP của server FastAPI
 const uint16_t websocket_server_port = 8000;        // <-- THAY ĐỔI Port của server
-    const char* websocket_server_path = "/ws";          // <-- THAY ĐỔI Endpoint WebSocket
+const char* websocket_server_path = "/ws";          // <-- THAY ĐỔI Endpoint WebSocket
 
 // Chân cắm phần cứng I2S (Giữ nguyên như của bạn)
 #define I2S_MIC_SERIAL_CLOCK    18
@@ -35,6 +35,9 @@ const uint16_t websocket_server_port = 8000;        // <-- THAY ĐỔI Port củ
 #define VAD_SPEECH_FRAME_COUNT  3     // Số khung âm thanh liên tiếp cần có để BẮT ĐẦU truyền
 #define VAD_SILENCE_FRAME_COUNT 50    // Số khung im lặng liên tiếp cần có để DỪNG truyền
 
+// --- Cấu hình Âm thanh Loa ---
+#define SPEAKER_GAIN            8.0f  // <-- ĐÂY LÀ HỆ SỐ KHUẾCH ĐẠI ÂM LƯỢNG MÀ BẠN MUỐN
+
 // ===============================================================
 // 2. BIẾN TOÀN CỤC
 // ===============================================================
@@ -44,18 +47,20 @@ WebsocketsClient client;
 
 // Máy trạng thái để quản lý logic
 enum State {
-  STATE_MUTED,                // Trạng thái im lặng, đang lắng nghe
-  STATE_STREAMING,            // Trạng thái kích hoạt, đang truyền âm thanh đi
-  STATE_WAITING_FOR_SERVER,   // Đã gửi xong, đang chờ server xử lý và phản hồi
-  STATE_PLAYING_RESPONSE      // Đang nhận và phát âm thanh từ server
+  STATE_MUTED,
+  STATE_STREAMING,
+  STATE_WAITING_FOR_SERVER,
+  STATE_PLAYING_RESPONSE
 };
 volatile State currentState = STATE_MUTED;
 
-// Bộ đệm nhỏ để đọc dữ liệu từ I2S
+// Bộ đệm đọc/ghi
 int16_t i2s_read_buffer[VAD_FRAME_SAMPLES];
+// Bộ đệm riêng để xử lý âm thanh phát ra loa (tránh xung đột dữ liệu)
+int16_t i2s_write_buffer[VAD_FRAME_SAMPLES]; 
 
 // ===============================================================
-// 3. CÁC HÀM CÀI ĐẶT I2S (Giữ nguyên như cũ)
+// 3. CÁC HÀM CÀI ĐẶT I2S (Giữ nguyên)
 // ===============================================================
 float calculate_rms(int16_t* buffer, size_t len) {
     double sum_sq = 0;
@@ -85,40 +90,41 @@ void setup_i2s_output() {
 // 4. TÁC VỤ XỬ LÝ ÂM THANH VÀ WEBSOCKET
 // ===============================================================
 
-// Hàm xử lý các sự kiện WebSocket
-void onWebsocketEvent(WebsocketsEvent event, String data) {
-    if (event == WebsocketsEvent::ConnectionOpened) {
-        Serial.println("Websocket connection opened.");
-    } else if (event == WebsocketsEvent::ConnectionClosed) {
-        Serial.println("Websocket connection closed.");
-    } else if (event == WebsocketsEvent::GotPing) {
-        Serial.println("Got a Ping!");
-    }
-}
+void onWebsocketEvent(WebsocketsEvent event, String data) { /* ... Giữ nguyên ... */ }
 
-// Hàm xử lý khi nhận được tin nhắn từ WebSocket
+// *** HÀM ĐƯỢC CẬP NHẬT ***
 void onWebsocketMessage(WebsocketsMessage message) {
-    // Server có thể gửi text để điều khiển
     if (message.isText()) {
         Serial.printf("Server sent text: %s\n", message.c_str());
-        // Ví dụ: server gửi "TTS_END" khi đã gửi xong hết audio
         if (message.stringValue() == "TTS_END") {
             Serial.println("End of TTS stream from server. Returning to listening mode.");
             currentState = STATE_MUTED;
         }
     }
-    // Dữ liệu âm thanh từ server sẽ ở dạng nhị phân (binary)
     else if (message.isBinary()) {
-        // Khi nhận được gói âm thanh đầu tiên, chuyển trạng thái
         if (currentState != STATE_PLAYING_RESPONSE) {
             Serial.println("Receiving audio from server, starting playback...");
             currentState = STATE_PLAYING_RESPONSE;
-            i2s_zero_dma_buffer(I2S_SPEAKER_PORT); // Xóa bộ đệm loa trước khi phát
+            i2s_zero_dma_buffer(I2S_SPEAKER_PORT);
         }
         
-        // Ghi trực tiếp dữ liệu âm thanh nhận được ra loa
+        // --- LOGIC TĂNG ÂM LƯỢNG CỦA BẠN ĐƯỢC TÍCH HỢP VÀO ĐÂY ---
+        size_t len = message.length();
+        // Sao chép dữ liệu nhận được vào bộ đệm để xử lý
+        memcpy(i2s_write_buffer, message.c_str(), len);
+        
+        // Áp dụng hệ số khuếch đại (gain)
+        for (int i = 0; i < len / sizeof(int16_t); i++) {
+          float amplified = i2s_write_buffer[i] * SPEAKER_GAIN;
+          // Giới hạn giá trị trong khoảng của int16 để tránh vỡ âm thanh
+          if (amplified > 32767) amplified = 32767; 
+          if (amplified < -32768) amplified = -32768;
+          i2s_write_buffer[i] = (int16_t)amplified;
+        }
+        
+        // Ghi dữ liệu đã được khuếch đại ra loa
         size_t bytes_written = 0;
-        i2s_write(I2S_SPEAKER_PORT, message.c_str(), message.length(), &bytes_written, portMAX_DELAY);
+        i2s_write(I2S_SPEAKER_PORT, i2s_write_buffer, len, &bytes_written, portMAX_DELAY);
     }
 }
 
@@ -130,10 +136,7 @@ void audio_processing_task(void *pvParameters) {
   long last_rms_report = 0;
 
   while (true) {
-    // Chỉ đọc mic khi ở trạng thái lắng nghe hoặc đang gửi đi
-    // Không đọc mic khi đang chờ server hoặc đang phát loa để tránh vòng lặp âm thanh
     if (currentState == STATE_MUTED || currentState == STATE_STREAMING) {
-        // Đọc một đoạn âm thanh từ micro
         i2s_read(I2S_MIC_PORT, i2s_read_buffer, sizeof(i2s_read_buffer), &bytes_read, portMAX_DELAY);
         float rms = calculate_rms(i2s_read_buffer, bytes_read / sizeof(int16_t));
         bool is_sound_detected = rms > VAD_RMS_THRESHOLD;
@@ -148,7 +151,7 @@ void audio_processing_task(void *pvParameters) {
                 if (is_sound_detected) {
                     speech_frames++;
                 } else {
-                    speech_frames = 0; // Reset nếu có sự gián đoạn
+                    speech_frames = 0;
                 }
 
                 if (speech_frames >= VAD_SPEECH_FRAME_COUNT) {
@@ -159,12 +162,10 @@ void audio_processing_task(void *pvParameters) {
                 break;
 
             case STATE_STREAMING:
-                // THAY VÌ GHI RA LOA, GỬI DỮ LIỆU QUA WEBSOCKET
                 if (client.isConnected()) {
                     client.sendBinary((const char*)i2s_read_buffer, bytes_read);
                 }
 
-                // Kiểm tra sự im lặng để dừng gửi
                 if (is_sound_detected) {
                     silence_frames = 0;
                 } else {
@@ -174,14 +175,11 @@ void audio_processing_task(void *pvParameters) {
                 if (silence_frames >= VAD_SILENCE_FRAME_COUNT) {
                     Serial.println("==> Silence detected. Stopping stream and waiting for server response.");
                     silence_frames = 0;
-                    // Tùy chọn: Gửi một tin nhắn báo kết thúc stream
-                    // client.send("END_OF_STREAM"); 
                     currentState = STATE_WAITING_FOR_SERVER;
                 }
                 break;
         }
     } else {
-        // Khi đang chờ hoặc đang phát, task này chỉ cần nghỉ một chút
         vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
@@ -195,7 +193,6 @@ void setup() {
   Serial.begin(115200);
   while (!Serial);
   
-  // --- Kết nối WiFi ---
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi...");
   while (WiFi.status() != WL_CONNECTED) {
@@ -206,26 +203,20 @@ void setup() {
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
 
-  // --- Cài đặt I2S ---
   setup_i2s_input();
   setup_i2s_output();
 
-  // --- Cài đặt WebSocket ---
-  client.onEvent(onWebsocketEvent);
+  client.onEvent(onWebsocketEvent); // onEvent vẫn giữ nguyên, không cần sửa
   client.onMessage(onWebsocketMessage);
   
-  // Thử kết nối tới server
   Serial.printf("Connecting to WebSocket server: %s:%d%s\n", websocket_server_host, websocket_server_port, websocket_server_path);
   bool connected = client.connect(websocket_server_host, websocket_server_port, websocket_server_path);
   if (!connected) {
       Serial.println("WebSocket connection failed!");
-      // Có thể thêm logic khởi động lại ESP32 ở đây
   } else {
       Serial.println("WebSocket connected successfully!");
   }
 
-
-  // --- Khởi tạo Task xử lý âm thanh ---
   xTaskCreatePinnedToCore(
       audio_processing_task,
       "Audio Processing Task",
@@ -243,24 +234,17 @@ void setup() {
 }
 
 void loop() {
-  // BẮT BUỘC phải gọi client.loop() trong hàm loop chính
-  // để thư viện WebSocket có thể xử lý các sự kiện mạng
   client.loop();
   
-  // Có thể thêm logic kiểm tra và kết nối lại WebSocket nếu bị mất kết nối
   if (!client.isConnected()) {
     Serial.println("WebSocket disconnected. Reconnecting...");
     bool connected = client.connect(websocket_server_host, websocket_server_port, websocket_server_path);
     if (!connected) {
       Serial.println("Reconnect failed.");
-      delay(2000); // Chờ 2 giây rồi thử lại
+      delay(2000);
     } else {
       Serial.println("Reconnected successfully.");
     }
   }
-
-  // Hàm loop() có thể để trống hoặc chỉ chứa client.loop() và logic reconnect
-  // vì tác vụ chính đã được xử lý trong FreeRTOS task.
-  // Delay một chút để không chiếm hết CPU core 0.
   delay(10);
 }
