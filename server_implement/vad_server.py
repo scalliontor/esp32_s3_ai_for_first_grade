@@ -9,7 +9,6 @@ import torch
 from collections import deque
 
 # --- IMPORT PIPELINE TỪ THƯ MỤC MODULES ---
-# Đảm bảo bạn có file `modules/pipeline.py` chứa class VoiceAssistantPipeline
 from modules.pipeline import VoiceAssistantPipeline
 
 # --- Cấu hình ---
@@ -18,32 +17,27 @@ BIT_DEPTH_BYTES = 2
 CHANNELS = 1
 AUDIO_CHUNK_SIZE = 1024 # Kích thước mỗi đoạn audio gửi về client
 
-# --- Cấu hình VAD (Voice Activity Detection) ---
+# --- <<< NEW: Cấu hình VAD >>> ---
 VAD_FRAME_MS = 30  # Silero VAD hoạt động tốt nhất với frame 30ms
-VAD_CHUNK_SIZE = (SAMPLE_RATE * VAD_FRAME_MS // 1000) * BIT_DEPTH_BYTES # = 960 bytes
+VAD_CHUNK_SIZE = (SAMPLE_RATE * VAD_FRAME_MS // 1000) * BIT_DEPTH_BYTES # = 960 bytes cho 30ms @ 16kHz/16bit
 VAD_SPEECH_THRESHOLD = 0.5  # Ngưỡng tin cậy để coi là có tiếng nói
 VAD_SILENCE_FRAMES_TRIGGER = 1  # Số frame có tiếng nói liên tiếp để bắt đầu thu
-VAD_SILENCE_FRAMES_END = 25     # Số frame im lặng liên tiếp để kết thúc thu (~0.75s)
+VAD_SILENCE_FRAMES_END = 25     # Số frame im lặng liên tiếp để kết thúc thu (khoảng 0.75s)
 VAD_BUFFER_FRAMES = 5       # Lưu lại 5 frame âm thanh ngay TRƯỚC khi có tiếng nói
 
 # --- Khởi tạo ứng dụng và các mô hình AI ---
 app = FastAPI()
 
-print("\n============================================================")
-print("🚀 Initializing Voice Assistant Pipeline")
-print("============================================================\n")
+# Khởi tạo pipeline MỘT LẦN DUY NHẤT khi server bắt đầu.
 pipeline = VoiceAssistantPipeline()
-print("\n============================================================")
-print("✅ Pipeline Ready!")
-print("============================================================\n")
 
-# Tải mô hình Silero VAD
+# <<< NEW: Tải mô hình Silero VAD >>>
 try:
     torch.set_num_threads(1)
     vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
                                       model='silero_vad',
                                       force_reload=False,
-                                      onnx=True)
+                                      onnx=True) # Dùng ONNX để nhanh hơn trên CPU
     (get_speech_timestamps, save_audio, read_audio, VADIterator, collect_chunks) = utils
     print("Silero VAD model loaded successfully.")
 except Exception as e:
@@ -71,55 +65,64 @@ def save_audio_to_wav(audio_data: bytes, folder: str = "audio_files") -> str:
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
-    Endpoint nhận stream audio liên tục, dùng VAD để quyết định, 
+    Endpoint nhận stream audio LIÊN TỤC, dùng VAD để quyết định, 
     gọi AI pipeline, và stream audio trả về.
     """
     await websocket.accept()
     print(f"Client connected from: {websocket.client.host}")
     
+    # <<< NEW: Logic VAD state machine >>>
     is_speaking = False
     silence_counter = 0
     speech_trigger_counter = 0
-    is_processing = False
     
+    # Dùng deque để làm bộ đệm vòng hiệu quả
     pre_buffer = deque(maxlen=VAD_BUFFER_FRAMES) 
     speech_buffer = []
-
+    
     try:
+        # Vòng lặp nhận dữ liệu liên tục
         while True:
+            # Nhận chính xác kích thước chunk mà VAD cần
             data = await websocket.receive_bytes()
-
-            if is_processing:
-                continue # Nếu server đang bận, bỏ qua các gói tin đến
-
+            
             if len(data) != VAD_CHUNK_SIZE:
+                # Bỏ qua các gói tin không đúng kích thước nếu có
+                # Hoặc có thể xử lý ghép nối các gói tin nhỏ lại
                 print(f"Warning: Received chunk of size {len(data)}, expected {VAD_CHUNK_SIZE}. Skipping.")
                 continue
 
-            audio_tensor = torch.from_numpy(bytearray(data)).to(torch.int16).float() / 32768.0
+            # Chuyển bytes thành tensor cho VAD model
+            audio_tensor = torch.from_numpy(
+                bytearray(data)
+            ).to(torch.int16).float() / 32768.0
+
+            # Dự đoán xác suất có tiếng nói
             speech_prob = vad_model(audio_tensor, SAMPLE_RATE).item()
 
             if speech_prob > VAD_SPEECH_THRESHOLD:
+                # Phát hiện có tiếng nói
                 silence_counter = 0
                 if not is_speaking:
                     speech_trigger_counter += 1
                     if speech_trigger_counter >= VAD_SILENCE_FRAMES_TRIGGER:
                         print("==> Voice activity detected. Start recording.")
                         is_speaking = True
+                        # Đổ toàn bộ pre_buffer vào speech_buffer
                         speech_buffer.extend(list(pre_buffer))
+                
                 if is_speaking:
                     speech_buffer.append(data)
             else:
+                # Phát hiện im lặng
                 speech_trigger_counter = 0
                 if is_speaking:
                     silence_counter += 1
-                    speech_buffer.append(data)
+                    speech_buffer.append(data) # Vẫn thu thêm một chút im lặng
                     if silence_counter >= VAD_SILENCE_FRAMES_END:
                         print("==> Silence detected. End of utterance.")
                         
-                        is_processing = True
-                        await websocket.send_text("PROCESSING_START")
-                        
+                        # --- BẮT ĐẦU XỬ LÝ PIPELINE ---
                         full_audio_data = b"".join(speech_buffer)
                         input_audio_path = save_audio_to_wav(full_audio_data)
                         
@@ -135,22 +138,24 @@ async def websocket_endpoint(websocket: WebSocket):
                                             chunk = audio_file.read(AUDIO_CHUNK_SIZE)
                                             if not chunk: break
                                             await websocket.send_bytes(chunk)
+                                    
+                                    await websocket.send_text("TTS_END")
+                                    print("Finished streaming response.")
                                 else:
                                     print("Pipeline did not return a valid audio output path.")
                             except Exception as e:
                                 print(f"An error occurred during pipeline processing: {e}")
-                            finally:
-                                # Dù thành công hay thất bại, luôn gửi tín hiệu kết thúc
-                                await websocket.send_text("TTS_END")
-                                print("Finished streaming response.")
-
+                        
+                        # Reset state để chờ câu nói tiếp theo
                         is_speaking = False
                         silence_counter = 0
                         speech_buffer.clear()
                         pre_buffer.clear()
-                        is_processing = False
+
                 else:
+                    # Nếu chưa nói, chỉ cần đẩy vào pre_buffer
                     pre_buffer.append(data)
+
 
     except WebSocketDisconnect:
         print(f"Client {websocket.client.host} disconnected.")
@@ -160,4 +165,3 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/")
 def read_root():
     return {"status": "Voice Assistant Server is running"}
-

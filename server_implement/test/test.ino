@@ -34,9 +34,12 @@ const char* websocket_server_path = "/ws";
 
 // --- Cài đặt VAD ---
 #define VAD_FRAME_SAMPLES       512
-#define VAD_RMS_THRESHOLD       800
-#define VAD_SPEECH_FRAME_COUNT  3
-#define VAD_SILENCE_FRAME_COUNT 50
+#define VAD_RMS_THRESHOLD       800  // Tinh chỉnh giá trị này cho mic của bạn
+#define VAD_SPEECH_FRAME_COUNT  3    // Số frame liên tiếp phải có tiếng nói để kích hoạt
+#define VAD_SILENCE_FRAME_COUNT 50   // Số frame liên tiếp phải im lặng để ngừng stream
+
+// --- Cấu hình Bộ đệm vòng (Circular Buffer) --- // <<< NEW >>>
+#define PRE_SPEECH_BUFFER_FRAMES 10  // Lưu lại 10 frame trước khi nói, có thể tăng/giảm
 
 // --- Cấu hình Âm thanh Loa ---
 #define SPEAKER_GAIN            8.0f
@@ -55,8 +58,13 @@ enum State {
 };
 volatile State currentState = STATE_MUTED;
 
-int16_t i2s_read_buffer[VAD_FRAME_SAMPLES];
-int16_t i2s_write_buffer[VAD_FRAME_SAMPLES]; 
+// Buffer để đọc/ghi I2S
+int16_t i2s_buffer[VAD_FRAME_SAMPLES];
+
+// <<< NEW: Circular buffer để lưu trữ âm thanh trước khi nói >>>
+int16_t pre_speech_buffer[PRE_SPEECH_BUFFER_FRAMES][VAD_FRAME_SAMPLES];
+int pre_speech_buffer_index = 0;
+
 
 // ===============================================================
 // 3. CÁC HÀM CÀI ĐẶT I2S (Giữ nguyên)
@@ -100,8 +108,7 @@ void onWebsocketEvent(WebsocketsEvent event, String data) {
 void onWebsocketMessage(WebsocketsMessage message) {
     if (message.isText()) {
         Serial.printf("Server sent text: %s\n", message.c_str());
-        // *** SỬA LỖI API: stringValue() -> data() ***
-        if (message.data() == "TTS_END") {
+        if (message.stringValue() == "TTS_END") {
             Serial.println("End of TTS stream from server. Returning to listening mode.");
             currentState = STATE_MUTED;
         }
@@ -114,17 +121,19 @@ void onWebsocketMessage(WebsocketsMessage message) {
         }
         
         size_t len = message.length();
-        memcpy(i2s_write_buffer, message.c_str(), len);
+        // Tạo một buffer tạm để khuếch đại âm thanh
+        int16_t temp_write_buffer[len / sizeof(int16_t)];
+        memcpy(temp_write_buffer, message.c_str(), len);
         
         for (int i = 0; i < len / sizeof(int16_t); i++) {
-          float amplified = i2s_write_buffer[i] * SPEAKER_GAIN;
+          float amplified = temp_write_buffer[i] * SPEAKER_GAIN;
           if (amplified > 32767) amplified = 32767; 
           if (amplified < -32768) amplified = -32768;
-          i2s_write_buffer[i] = (int16_t)amplified;
+          temp_write_buffer[i] = (int16_t)amplified;
         }
         
         size_t bytes_written = 0;
-        i2s_write(I2S_SPEAKER_PORT, i2s_write_buffer, len, &bytes_written, portMAX_DELAY);
+        i2s_write(I2S_SPEAKER_PORT, temp_write_buffer, len, &bytes_written, portMAX_DELAY);
     }
 }
 
@@ -136,51 +145,75 @@ void audio_processing_task(void *pvParameters) {
   long last_rms_report = 0;
 
   while (true) {
+    // Chỉ đọc từ mic khi không đang phát âm thanh trả về
     if (currentState == STATE_MUTED || currentState == STATE_STREAMING) {
-        i2s_read(I2S_MIC_PORT, i2s_read_buffer, sizeof(i2s_read_buffer), &bytes_read, portMAX_DELAY);
-        float rms = calculate_rms(i2s_read_buffer, bytes_read / sizeof(int16_t));
-        bool is_sound_detected = rms > VAD_RMS_THRESHOLD;
-
+        // Luôn đọc dữ liệu từ I2S
+        i2s_read(I2S_MIC_PORT, i2s_buffer, sizeof(i2s_buffer), &bytes_read, portMAX_DELAY);
+        
+        // <<< CHANGED: Logic xử lý trạng thái được viết lại cho rõ ràng hơn >>>
         switch (currentState) {
-            case STATE_MUTED:
+            case STATE_MUTED: {
+                // Thêm frame hiện tại vào bộ đệm vòng
+                memcpy(pre_speech_buffer[pre_speech_buffer_index], i2s_buffer, bytes_read);
+                pre_speech_buffer_index = (pre_speech_buffer_index + 1) % PRE_SPEECH_BUFFER_FRAMES;
+
+                // Tính RMS để phát hiện giọng nói
+                float rms = calculate_rms(i2s_buffer, bytes_read / sizeof(int16_t));
+                
                 if (millis() - last_rms_report > 1000) {
                     Serial.printf("Muted. Listening... RMS: %.2f\n", rms);
                     last_rms_report = millis();
                 }
 
-                if (is_sound_detected) {
+                if (rms > VAD_RMS_THRESHOLD) {
                     speech_frames++;
                 } else {
-                    speech_frames = 0;
+                    speech_frames = 0; // Reset nếu có frame im lặng xen kẽ
                 }
 
                 if (speech_frames >= VAD_SPEECH_FRAME_COUNT) {
-                    Serial.printf("==> Voice detected! RMS: %.2f. Starting stream to server.\n", rms);
-                    speech_frames = 0;
+                    Serial.printf("==> Voice detected! RMS: %.2f. Starting stream.\n", rms);
+                    
                     currentState = STATE_STREAMING;
+                    speech_frames = 0; // Reset bộ đếm
+
+                    // <<< KEY CHANGE: Gửi toàn bộ bộ đệm vòng (pre-speech buffer) trước >>>
+                    if (client.available()) {
+                        Serial.println("Sending pre-speech buffer...");
+                        // Vòng lặp này đảm bảo gửi các frame theo đúng thứ tự thời gian
+                        for (int i = 0; i < PRE_SPEECH_BUFFER_FRAMES; i++) {
+                            int buffer_to_send_index = (pre_speech_buffer_index + i) % PRE_SPEECH_BUFFER_FRAMES;
+                            client.sendBinary((const char*)pre_speech_buffer[buffer_to_send_index], sizeof(i2s_buffer));
+                        }
+                    }
                 }
                 break;
+            }
 
-            case STATE_STREAMING:
-                // *** SỬA LỖI API: isConnected() -> available() ***
+            case STATE_STREAMING: {
+                // Gửi frame hiện tại vừa đọc được
                 if (client.available()) {
-                    client.sendBinary((const char*)i2s_read_buffer, bytes_read);
+                    client.sendBinary((const char*)i2s_buffer, bytes_read);
                 }
 
-                if (is_sound_detected) {
-                    silence_frames = 0;
-                } else {
+                // Kiểm tra sự im lặng để kết thúc stream
+                float rms = calculate_rms(i2s_buffer, bytes_read / sizeof(int16_t));
+                if (rms <= VAD_RMS_THRESHOLD) {
                     silence_frames++;
+                } else {
+                    silence_frames = 0; // Reset nếu lại có tiếng nói
                 }
 
                 if (silence_frames >= VAD_SILENCE_FRAME_COUNT) {
                     Serial.println("==> Silence detected. Stopping stream and waiting for server response.");
-                    silence_frames = 0;
                     currentState = STATE_WAITING_FOR_SERVER;
+                    silence_frames = 0; // Reset bộ đếm
                 }
                 break;
+            }
         }
     } else {
+        // Nếu đang ở trạng thái khác (chờ server, phát loa), nghỉ một chút
         vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
@@ -211,8 +244,6 @@ void setup() {
   client.onMessage(onWebsocketMessage);
   
   Serial.printf("Connecting to WebSocket server: %s:%d%s\n", websocket_server_host, websocket_server_port, websocket_server_path);
-  // *** SỬA LỖI API: isConnected() -> available() ***
-  // Hàm connect bây giờ trả về bool, và ta kiểm tra trạng thái bằng client.available()
   bool connected = client.connect(websocket_server_host, websocket_server_port, websocket_server_path);
   if (!connected) {
       Serial.println("WebSocket connection attempt failed!");
@@ -220,10 +251,11 @@ void setup() {
       Serial.println("WebSocket connected successfully!");
   }
 
+  // Tăng stack size cho task audio nếu cần
   xTaskCreatePinnedToCore(
       audio_processing_task,
       "Audio Processing Task",
-      8192,
+      10240, // Tăng stack size lên 10KB
       NULL,
       10,
       NULL,
@@ -237,11 +269,8 @@ void setup() {
 }
 
 void loop() {
-  // *** SỬA LỖI API: loop() -> poll() ***
-  // Hàm này bây giờ gọi là poll() để xử lý các gói tin mạng
   client.poll();
   
-  // *** SỬA LỖI API: isConnected() -> available() ***
   if (!client.available()) {
     Serial.println("WebSocket disconnected. Reconnecting...");
     bool connected = client.connect(websocket_server_host, websocket_server_port, websocket_server_path);
