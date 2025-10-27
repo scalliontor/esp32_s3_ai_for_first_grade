@@ -10,9 +10,9 @@ using namespace websockets;
 // ===============================================================
 
 // --- Cấu hình Mạng & WebSocket ---
-const char* ssid = "PTIT_CIE";         // <-- THAY ĐỔI TÊN WIFI
-const char* password = "cie@2025"; // <-- THAY ĐỔI MẬT KHẨU WIFI
-const char* websocket_server_host = "10.170.77.48"; // <-- THAY ĐỔI IP CỦA SERVER
+const char* ssid = "iPhone của hành";         // <-- THAY ĐỔI TÊN WIFI
+const char* password = "123456780"; // <-- THAY ĐỔI MẬT KHẨU WIFI
+const char* websocket_server_host = "172.20.10.02"; // <-- THAY ĐỔI IP CỦA SERVER
 const uint16_t websocket_server_port = 8000;
 const char* websocket_server_path = "/ws";
 
