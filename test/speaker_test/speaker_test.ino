@@ -3,9 +3,9 @@
 
 #define I2S_NUM         I2S_NUM_0
 #define I2S_SAMPLE_RATE 44100
-#define I2S_BCK_IO      37
-#define I2S_WS_IO       38
-#define I2S_DO_IO       36
+#define I2S_BCK_IO  18  // BCLK
+#define I2S_WS_IO   5   // LRC
+#define I2S_DO_IO   19  // DIN
 
 #define PI 3.14159265
 #define TONE_FREQ 440 // Frequency in Hz (A4 note)
@@ -62,3 +62,4 @@ void setup() {
 void loop() {
   loopTone();
 }
+
